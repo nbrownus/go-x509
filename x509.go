@@ -20,6 +20,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"golang.org/x/crypto/ed25519"
 	"io"
 	"math/big"
 	"net"
@@ -85,8 +86,14 @@ func marshalPublicKey(pub interface{}) (publicKeyBytes []byte, publicKeyAlgorith
 			return
 		}
 		publicKeyAlgorithm.Parameters.FullBytes = paramBytes
+	case *ed25519.PublicKey:
+		publicKeyAlgorithm.Algorithm = oidKeyEd25519
+		return []byte(*pub), publicKeyAlgorithm, nil
+	case *X25519PublicKey:
+		publicKeyAlgorithm.Algorithm = oidKeyX25519
+		return []byte(*pub), publicKeyAlgorithm, nil
 	default:
-		return nil, pkix.AlgorithmIdentifier{}, errors.New("x509: only RSA and ECDSA public keys supported")
+		return nil, pkix.AlgorithmIdentifier{}, errors.New("x509: only RSA, ECDSA, ed25519, or X25519 public keys supported")
 	}
 
 	return publicKeyBytes, publicKeyAlgorithm, nil
@@ -181,6 +188,7 @@ const (
 	SHA256WithRSAPSS
 	SHA384WithRSAPSS
 	SHA512WithRSAPSS
+	ED25519SIG
 )
 
 func (algo SignatureAlgorithm) isRSAPSS() bool {
@@ -208,6 +216,7 @@ var algoName = [...]string{
 	ECDSAWithSHA256:  "ECDSA-SHA256",
 	ECDSAWithSHA384:  "ECDSA-SHA384",
 	ECDSAWithSHA512:  "ECDSA-SHA512",
+	ED25519SIG:       "Ed25519",
 }
 
 func (algo SignatureAlgorithm) String() string {
@@ -224,7 +233,12 @@ const (
 	RSA
 	DSA
 	ECDSA
+	ED25519
+	X25519
 )
+
+// curve25519 package does not expose key types
+type X25519PublicKey []byte
 
 // OIDs for signature algorithms
 //
@@ -325,6 +339,7 @@ var signatureAlgorithmDetails = []struct {
 	{ECDSAWithSHA256, oidSignatureECDSAWithSHA256, ECDSA, crypto.SHA256},
 	{ECDSAWithSHA384, oidSignatureECDSAWithSHA384, ECDSA, crypto.SHA384},
 	{ECDSAWithSHA512, oidSignatureECDSAWithSHA512, ECDSA, crypto.SHA512},
+	{ED25519SIG, oidKeyEd25519, ED25519, crypto.Hash(0)},
 }
 
 // pssParameters reflects the parameters in an AlgorithmIdentifier that
@@ -467,6 +482,10 @@ func getPublicKeyAlgorithmFromOID(oid asn1.ObjectIdentifier) PublicKeyAlgorithm 
 		return DSA
 	case oid.Equal(oidPublicKeyECDSA):
 		return ECDSA
+	case oid.Equal(oidKeyEd25519):
+		return ED25519
+	case oid.Equal(oidKeyX25519):
+		return X25519
 	}
 	return UnknownPublicKeyAlgorithm
 }
@@ -492,6 +511,14 @@ var (
 	oidNamedCurveP256 = asn1.ObjectIdentifier{1, 2, 840, 10045, 3, 1, 7}
 	oidNamedCurveP384 = asn1.ObjectIdentifier{1, 3, 132, 0, 34}
 	oidNamedCurveP521 = asn1.ObjectIdentifier{1, 3, 132, 0, 35}
+)
+
+// https://datatracker.ietf.org/doc/draft-ietf-curdle-pkix/?include_text=1
+// id-X25519    OBJECT IDENTIFIER ::= { 1 3 101 110 }
+// id-Ed25519   OBJECT IDENTIFIER ::= { 1 3 101 112 }
+var (
+	oidKeyX25519  = asn1.ObjectIdentifier{1, 3, 101, 110}
+	oidKeyEd25519 = asn1.ObjectIdentifier{1, 3, 101, 112}
 )
 
 func namedCurveFromOID(oid asn1.ObjectIdentifier) elliptic.Curve {
@@ -822,17 +849,22 @@ func checkSignature(algo SignatureAlgorithm, signed, signature []byte, publicKey
 		hashType = crypto.SHA512
 	case MD2WithRSA, MD5WithRSA:
 		return InsecureAlgorithmError(algo)
+	case ED25519SIG:
+		hashType = 0
 	default:
 		return ErrUnsupportedAlgorithm
 	}
 
-	if !hashType.Available() {
-		return ErrUnsupportedAlgorithm
-	}
-	h := hashType.New()
+	digest := signed
+	if hashType != 0 {
+		if !hashType.Available() {
+			return ErrUnsupportedAlgorithm
+		}
+		h := hashType.New()
 
-	h.Write(signed)
-	digest := h.Sum(nil)
+		h.Write(signed)
+		digest = h.Sum(nil)
+	}
 
 	switch pub := publicKey.(type) {
 	case *rsa.PublicKey:
@@ -869,7 +901,13 @@ func checkSignature(algo SignatureAlgorithm, signed, signature []byte, publicKey
 			return errors.New("x509: ECDSA verification failure")
 		}
 		return
+	case *ed25519.PublicKey:
+		if !ed25519.Verify(*pub, digest, signature) {
+			return errors.New("x509: ED25519 verification failure")
+		}
+		return
 	}
+
 	return ErrUnsupportedAlgorithm
 }
 
@@ -1012,6 +1050,18 @@ func parsePublicKey(algo PublicKeyAlgorithm, keyData *publicKeyInfo) (interface{
 			Y:     y,
 		}
 		return pub, nil
+	case ED25519:
+		p := ed25519.PublicKey(asn1Data)
+		if len(p) > ed25519.PublicKeySize {
+			return nil, errors.New("x509: trailing data after Ed25519 data")
+		}
+		return &p, nil
+	case X25519:
+		p := X25519PublicKey(asn1Data)
+		if len(p) > 32 {
+			return nil, errors.New("x509: trailing data after X25519 public key")
+		}
+		return &p, nil
 	default:
 		return nil, nil
 	}
@@ -1640,6 +1690,7 @@ func subjectBytes(cert *Certificate) ([]byte, error) {
 // signature algorithm.
 func signingParamsForPublicKey(pub interface{}, requestedSigAlgo SignatureAlgorithm) (hashFunc crypto.Hash, sigAlgo pkix.AlgorithmIdentifier, err error) {
 	var pubType PublicKeyAlgorithm
+	shouldHash := true
 
 	switch pub := pub.(type) {
 	case *rsa.PublicKey:
@@ -1667,8 +1718,15 @@ func signingParamsForPublicKey(pub interface{}, requestedSigAlgo SignatureAlgori
 			err = errors.New("x509: unknown elliptic curve")
 		}
 
+	case *ed25519.PublicKey, ed25519.PublicKey:
+		// ed25519.PublicKey doesn't return a pointer to the key so we check for both
+		pubType = ED25519
+		hashFunc = 0
+		shouldHash = false
+		sigAlgo.Algorithm = oidKeyEd25519
+
 	default:
-		err = errors.New("x509: only RSA and ECDSA keys supported")
+		err = errors.New("x509: only RSA, ECDSA, Ed25519, and X25519 keys supported")
 	}
 
 	if err != nil {
@@ -1687,7 +1745,7 @@ func signingParamsForPublicKey(pub interface{}, requestedSigAlgo SignatureAlgori
 				return
 			}
 			sigAlgo.Algorithm, hashFunc = details.oid, details.hash
-			if hashFunc == 0 {
+			if hashFunc == 0 && shouldHash {
 				err = errors.New("x509: cannot sign with hash function requested")
 				return
 			}
@@ -1778,9 +1836,12 @@ func CreateCertificate(rand io.Reader, template, parent *Certificate, pub, priv 
 
 	c.Raw = tbsCertContents
 
-	h := hashFunc.New()
-	h.Write(tbsCertContents)
-	digest := h.Sum(nil)
+	digest := tbsCertContents
+	if hashFunc != 0 {
+		h := hashFunc.New()
+		h.Write(tbsCertContents)
+		digest = h.Sum(nil)
+	}
 
 	var signerOpts crypto.SignerOpts
 	signerOpts = hashFunc
